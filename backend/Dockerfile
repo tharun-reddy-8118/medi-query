@@ -22,5 +22,5 @@ COPY . .
 # Expose FastAPI port
 EXPOSE 8000
 
-# Run uvicorn server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run uvicorn server on port 7860 (required by Hugging Face Spaces)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
