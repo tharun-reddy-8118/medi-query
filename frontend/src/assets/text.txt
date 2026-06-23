@@ -1,0 +1,1136 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import pandas as pd
+import duckdb
+import io
+import os
+import re
+import math
+from datetime import datetime
+from openai import OpenAI
+
+app = FastAPI(title="Healthcare Analytics API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Groq ──────────────────────────────────────────────────────────────────────
+client = OpenAI(
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
+)
+MODEL = "llama-3.1-8b-instant"
+
+# ── DuckDB ────────────────────────────────────────────────────────────────────
+con = duckdb.connect()
+datasets: dict = {}
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class QuestionRequest(BaseModel):
+    question: str
+    file_id: str
+
+
+class ForecastRequest(BaseModel):
+    file_id: str
+    date_col: str | None = None
+    date_column: str | None = None
+    dateCol: str | None = None
+    value_col: str | None = None
+    value_column: str | None = None
+    valueCol: str | None = None
+    target_col: str | None = None
+    metric: str | None = None
+    periods: int = 30
+    days: int | None = None
+    freq: str = "D"
+    frequency: str | None = None
+
+    def resolved_date_col(self):  return self.date_col or self.date_column or self.dateCol
+    def resolved_value_col(self): return self.value_col or self.value_column or self.valueCol or self.target_col or self.metric
+    def resolved_periods(self):   return self.days or self.periods
+    def resolved_freq(self):      return self.frequency or self.freq
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# COLUMN CLEANING
+# ════════════════════════════════════════════════════════════════════════════
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace(r"[\s\-/]+", "_", regex=True)
+        .str.replace(r"[^\w]", "", regex=True)
+    )
+    return df
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DATE NORMALISATION
+# ════════════════════════════════════════════════════════════════════════════
+
+DATE_FORMATS = [
+    "%d-%m-%Y %H:%M:%S", "%d-%m-%Y",
+    "%m-%d-%Y %H:%M:%S", "%m-%d-%Y",
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
+    "%m/%d/%Y %H:%M:%S", "%m/%d/%Y",
+    "%Y/%m/%d",
+]
+
+
+def try_parse_date_series(series: pd.Series):
+    sample = series.dropna().astype(str).head(20).tolist()
+    if not sample:
+        return None
+    for fmt in DATE_FORMATS:
+        matched = sum(1 for v in sample if _try_strptime(v.strip(), fmt))
+        if matched >= min(3, len(sample)):
+            try:
+                parsed = pd.to_datetime(
+                    series.astype(str).str.strip(), format=fmt, errors="coerce"
+                )
+                if parsed.notna().sum() / max(len(parsed), 1) >= 0.8:
+                    return parsed.dt.date
+            except Exception:
+                pass
+    try:
+        parsed = pd.to_datetime(series, infer_datetime_format=True, errors="coerce")
+        if parsed.notna().sum() / max(len(parsed), 1) >= 0.8:
+            return parsed.dt.date
+    except Exception:
+        pass
+    return None
+
+
+def _try_strptime(val: str, fmt: str) -> bool:
+    try:
+        datetime.strptime(val, fmt)
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_date_columns(df: pd.DataFrame):
+    date_cols = []
+    for col in df.select_dtypes(include=["object"]).columns:
+        result = try_parse_date_series(df[col])
+        if result is not None:
+            df[col] = result
+            date_cols.append(col)
+    return df, date_cols
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SEMANTIC CONCEPT → COLUMN RESOLVER
+#
+# This is the key fix: map natural-language concepts to actual column names.
+# When the user asks "doctor wise revenue", we detect "doctor" in the question,
+# scan all columns for the best semantic match, and inject a hard directive:
+#   "When user says 'doctor', use column X — NOT any other column."
+# ════════════════════════════════════════════════════════════════════════════
+
+# Each concept lists synonyms the user might say AND patterns we look for in column names.
+# Format: { concept_label: { "question_triggers": [...], "column_patterns": [...] } }
+CONCEPT_MAP = {
+    "doctor": {
+        "question_triggers": [
+            "doctor", "physician", "surgeon", "consultant", "clinician",
+            "dr ", "dr.", "doctor wise", "physician wise", "surgeon wise",
+            "consultant wise", "attending", "specialist", "provider",
+        ],
+        "column_patterns": [
+            "doctor", "physician", "surgeon", "consultant", "clinician",
+            "attending", "specialist", "provider", "performed", "dr",
+            "medical_officer", "mo", "staff_name", "staff", "practitioner",
+        ],
+    },
+    "department": {
+        "question_triggers": [
+            "department", "dept", "ward", "unit", "specialty", "speciality",
+            "department wise", "dept wise", "specialty wise",
+        ],
+        "column_patterns": [
+            "department", "dept", "ward", "unit", "specialty", "speciality",
+            "service", "division", "section", "branch",
+        ],
+    },
+    "patient": {
+        "question_triggers": [
+            "patient", "patient wise", "person", "individual", "uhid",
+            "patient id", "patient name",
+        ],
+        "column_patterns": [
+            "patient", "uhid", "pid", "patient_id", "patient_name",
+            "person", "name", "individual",
+        ],
+    },
+    "insurance": {
+        "question_triggers": [
+            "insurance", "payer", "scheme", "coverage", "insurer",
+            "insurance wise", "scheme wise",
+        ],
+        "column_patterns": [
+            "insurance", "payer", "scheme", "coverage", "insurer",
+            "policy", "provider_insurance",
+        ],
+    },
+    "admission_type": {
+        "question_triggers": [
+            "admission type", "admit type", "type of admission",
+            "ip", "op", "inpatient", "outpatient", "emergency",
+        ],
+        "column_patterns": [
+            "admission_type", "admit_type", "visit_type", "ip_op",
+            "category", "patient_type",
+        ],
+    },
+    "city": {
+        "question_triggers": ["city", "location", "place", "area", "region", "city wise"],
+        "column_patterns": ["city", "location", "place", "area", "region", "locality"],
+    },
+    "date": {
+        "question_triggers": [
+            "date", "day", "when", "admission date", "discharge date",
+            "visit date", "entry date",
+        ],
+        "column_patterns": [
+            "date", "day", "admission_date", "discharge_date",
+            "visit_date", "entry_date", "enter_date", "created",
+        ],
+    },
+    "revenue": {
+        "question_triggers": [
+            "revenue", "amount", "billing", "bill", "total", "income",
+            "collection", "earned", "payment", "paid",
+        ],
+        "column_patterns": [
+            "revenue", "amount", "billing", "bill", "total", "income",
+            "collection", "payment", "paid", "fee", "charge", "inr",
+            "billed", "collected",
+        ],
+    },
+    "diagnosis": {
+        "question_triggers": [
+            "diagnosis", "disease", "condition", "icd", "complaint",
+            "diagnosis wise",
+        ],
+        "column_patterns": [
+            "diagnosis", "disease", "condition", "icd", "complaint",
+            "ailment", "disorder",
+        ],
+    },
+}
+
+
+def _score_column(col_name: str, patterns: list[str]) -> float:
+    """
+    Score how well a column name matches a list of semantic patterns.
+    Returns 0.0–1.0. Higher = better match.
+    """
+    col_lower = col_name.lower()
+    col_tokens = set(re.split(r"[_\s]+", col_lower))
+
+    best = 0.0
+    for pat in patterns:
+        pat_lower = pat.lower()
+        pat_tokens = set(re.split(r"[_\s]+", pat_lower))
+
+        # Exact match
+        if col_lower == pat_lower:
+            return 1.0
+        # Full pattern contained in column name
+        if pat_lower in col_lower:
+            best = max(best, 0.9)
+        # Column name contained in pattern
+        if col_lower in pat_lower:
+            best = max(best, 0.75)
+        # Token overlap
+        overlap = col_tokens & pat_tokens
+        if overlap:
+            score = len(overlap) / max(len(col_tokens), len(pat_tokens))
+            best = max(best, score * 0.8)
+
+    return best
+
+
+def resolve_concept_columns(question: str, columns: list[str]) -> dict[str, str]:
+    """
+    For each concept triggered by the question, find the best matching column.
+
+    Returns a dict like:
+      { "doctor": "ConsultantName", "revenue": "Total_Billed_in_INR" }
+
+    Only includes concepts that:
+      1. Are triggered by the question text
+      2. Have a confident column match (score >= 0.35)
+    """
+    q_lower = question.lower()
+    resolved: dict[str, str] = {}
+
+    for concept, config in CONCEPT_MAP.items():
+        # Check if this concept is triggered by the question
+        triggered = any(trigger in q_lower for trigger in config["question_triggers"])
+        if not triggered:
+            continue
+
+        # Score every column against this concept's patterns
+        scores = [
+            (col, _score_column(col, config["column_patterns"]))
+            for col in columns
+        ]
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        best_col, best_score = scores[0]
+        if best_score >= 0.35:
+            resolved[concept] = best_col
+
+    return resolved
+
+
+def build_column_directive(resolved: dict[str, str]) -> str:
+    """
+    Build a crystal-clear directive block for the prompt.
+    E.g.:
+      COLUMN MAPPING (use EXACTLY these columns — do not substitute):
+        • When user says "doctor/physician/surgeon" → use column: ConsultantName
+        • When user says "revenue/amount/billing"   → use column: Total_Billed_in_INR
+    """
+    if not resolved:
+        return ""
+
+    concept_labels = {
+        "doctor":         '"doctor / physician / surgeon / consultant"',
+        "department":     '"department / dept / ward / specialty"',
+        "patient":        '"patient / uhid / patient id"',
+        "insurance":      '"insurance / payer / scheme"',
+        "admission_type": '"admission type / ip / op"',
+        "city":           '"city / location / area"',
+        "date":           '"date / admission date / visit date"',
+        "revenue":        '"revenue / amount / billing / total"',
+        "diagnosis":      '"diagnosis / disease / condition"',
+    }
+
+    lines = ["COLUMN MAPPING — use EXACTLY these columns, do not substitute with any other:\n"]
+    for concept, col in resolved.items():
+        label = concept_labels.get(concept, f'"{concept}"')
+        lines.append(f"  • When user says {label}  →  use column: {col}")
+
+    lines.append(
+        "\nCRITICAL: If user says 'doctor wise', GROUP BY the doctor column above. "
+        "Never use a department or specialty column when the user asked for doctor."
+    )
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FUZZY COLUMN MATCHER  (fallback for hallucinated identifiers in SQL)
+# ════════════════════════════════════════════════════════════════════════════
+
+_SQL_KEYWORDS = {
+    "select","from","where","group","by","order","having","limit",
+    "count","sum","avg","max","min","round","distinct","as","and","or",
+    "not","in","like","ilike","between","is","null","true","false",
+    "asc","desc","on","join","inner","left","right","outer","case",
+    "when","then","else","end","cast","try_cast","double","date",
+    "varchar","integer","year","month","day","strptime","all","top",
+    "with","over","partition","row_number","strftime","coalesce",
+}
+
+
+def _col_tokens(name: str) -> set:
+    return set(re.split(r"[_\s]+", name.lower()))
+
+
+def find_closest_column(name: str, real_columns: list) -> str | None:
+    nl = name.lower()
+    for col in real_columns:
+        if col.lower() == nl:
+            return col
+    for col in real_columns:
+        if nl in col.lower() or col.lower() in nl:
+            return col
+    scores = [
+        (col, len(_col_tokens(name) & _col_tokens(col)) /
+              max(len(_col_tokens(name)), len(_col_tokens(col)), 1))
+        for col in real_columns
+    ]
+    best_col, best_score = max(scores, key=lambda x: x[1])
+    return best_col if best_score >= 0.4 else None
+
+
+def fix_hallucinated_columns(sql: str, real_columns: list) -> str:
+    real_lower = {c.lower(): c for c in real_columns}
+
+    def replace_id(m: re.Match) -> str:
+        word = m.group(0)
+        if word.lower() in _SQL_KEYWORDS:
+            return word
+        if word.lower() in real_lower:
+            return real_lower[word.lower()]
+        closest = find_closest_column(word, real_columns)
+        return closest if closest else word
+
+    return re.sub(r"(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)(?![\w(])", replace_id, sql)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SQL EXTRACTION
+# ════════════════════════════════════════════════════════════════════════════
+
+def extract_sql(raw: str) -> str:
+    cleaned = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```", "", cleaned).strip()
+    match = re.search(r"(SELECT\b.*?)(?:;|$)", cleaned, re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise ValueError(f"No SELECT found in LLM output:\n{raw[:400]}")
+    return match.group(1).strip() + ";"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SQL SANITISATION
+# ════════════════════════════════════════════════════════════════════════════
+
+_BAD_FUNC_SUBS = [
+    (r"\bEXIT\s*\(([^)]+)\)",                              r"\1"),
+    (r"\bDATEPART\s*\(\s*'month'\s*,\s*([^)]+)\)",        r"MONTH(\1)"),
+    (r"\bDATEPART\s*\(\s*'year'\s*,\s*([^)]+)\)",         r"YEAR(\1)"),
+    (r"\bDATEPART\s*\(\s*'day'\s*,\s*([^)]+)\)",          r"DAY(\1)"),
+    (r"\bDATE_FORMAT\s*\(([^,]+),\s*([^)]+)\)",           r"STRFTIME(\1, \2)"),
+    (r"\bCONVERT\s*\(\s*DATE\s*,\s*([^)]+)\)",            r"CAST(\1 AS DATE)"),
+    (r"\bTO_DATE\s*\(([^)]+)\)",                           r"CAST(\1 AS DATE)"),
+    (r"\bSTR_TO_DATE\s*\(([^,]+),\s*([^)]+)\)",           r"STRPTIME(\1, \2)"),
+]
+
+
+def _fix_date_literals(sql: str) -> str:
+    pat = re.compile(r"'(\d{1,2})[/-](\d{1,2})[/-](\d{4})'")
+    def rewrite(m: re.Match) -> str:
+        p1, p2, year = m.group(1), m.group(2), m.group(3)
+        return f"'{year}-{p2.zfill(2)}-{p1.zfill(2)}'"
+    return pat.sub(rewrite, sql)
+
+
+def _cast_varchar_arithmetic(sql: str) -> str:
+    def wrap(m: re.Match) -> str:
+        left, op, right = m.group(1), m.group(2), m.group(3)
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", left):
+            left = f"TRY_CAST({left} AS DOUBLE)"
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", right):
+            right = f"TRY_CAST({right} AS DOUBLE)"
+        return f"{left} {op} {right}"
+    sql = re.sub(r"([A-Za-z_][A-Za-z0-9_]*)\s*([*/])\s*(\d+(?:\.\d+)?)", wrap, sql)
+    sql = re.sub(r"(\d+(?:\.\d+)?)\s*([*/])\s*([A-Za-z_][A-Za-z0-9_]*)", wrap, sql)
+    return sql
+
+
+def _inject_not_null_for_group_by(sql: str) -> str:
+    """
+    Inject col IS NOT NULL for every GROUP BY column.
+
+    Original bug: f"\\1 {col} IS NOT NULL AND" — \\1 in an f-string is ASCII 0x01,
+    not a backreference. This silently deleted WHERE from the SQL.
+    Fix: use r"\\g<1>" as a raw-string literal, concatenated outside the f-string.
+    """
+    group_match = re.search(
+        r"GROUP\s+BY\s+([\w,\s]+?)(?:\s+ORDER|\s+HAVING|\s+LIMIT|;|$)",
+        sql, re.IGNORECASE
+    )
+    if not group_match:
+        return sql
+
+    group_cols = [c.strip() for c in group_match.group(1).split(",")]
+
+    for col in group_cols:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", col):
+            continue
+        if re.search(rf"\b{re.escape(col)}\s+IS\s+NOT\s+NULL", sql, re.IGNORECASE):
+            continue
+
+        null_check = f"{col} IS NOT NULL"
+
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(
+                r"(\bWHERE\b\s+)",
+                r"\g<1>" + null_check + " AND ",   # ← fixed: r"\g<1>" not f"\1"
+                sql, count=1, flags=re.IGNORECASE
+            )
+        else:
+            sql = re.sub(
+                r"(\bGROUP\s+BY\b)",
+                f"WHERE {null_check} GROUP BY",
+                sql, count=1, flags=re.IGNORECASE
+            )
+
+    return sql
+
+
+def _ilike_string_comparisons(sql: str) -> str:
+    _iso = re.compile(r"'\d{4}-\d{2}-\d{2}'")
+
+    def rewrite(m: re.Match) -> str:
+        col, op, val = m.group(1), m.group(2), m.group(3)
+        if _iso.match(val):
+            return m.group(0)
+        if re.fullmatch(r"[\d.]+", val.strip("'")):
+            return m.group(0)
+        if op.strip() in ("!=", "<>"):
+            return f"{col} NOT ILIKE {val}"
+        return f"{col} ILIKE {val}"
+
+    return re.sub(r"(\b[\w.]+\b)\s*(=|!=|<>)\s*('[^']*')", rewrite, sql)
+
+
+def sanitize_sql(sql: str, date_cols: list) -> str:
+    for pat, rep in _BAD_FUNC_SUBS:
+        sql = re.sub(pat, rep, sql, flags=re.IGNORECASE)
+
+    for col in date_cols:
+        sql = re.sub(
+            r"CAST\s*\(\s*[\"']?" + re.escape(col) + r"[\"']?\s+AS\s+DATE\s*\)",
+            col, sql, flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            r"CAST\s*\(\s*STRPTIME\s*\([^)]*" + re.escape(col) + r"[^)]*\)\s*AS\s*DATE\s*\)",
+            col, sql, flags=re.IGNORECASE,
+        )
+
+    sql = _fix_date_literals(sql)
+    sql = _ilike_string_comparisons(sql)
+    sql = _cast_varchar_arithmetic(sql)
+    sql = _inject_not_null_for_group_by(sql)
+    return sql
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST-EXECUTION COLUMN GUARD
+# If the resolved concept column is NOT in the result, re-run with a forced query
+# ════════════════════════════════════════════════════════════════════════════
+
+def _verify_and_rerun(
+    sql: str,
+    result_df: pd.DataFrame,
+    resolved: dict,
+    question: str,
+    table: str,
+    columns: list,
+    date_cols: list,
+) -> pd.DataFrame:
+    """
+    After execution, check that the GROUP BY column matches what the user intended.
+    If 'doctor' was resolved to column X but the SQL grouped by a different column, rewrite it.
+    """
+    # Extract what the SQL actually grouped by
+    gby_match = re.search(r"GROUP\s+BY\s+([\w,\s]+?)(?:\s+ORDER|\s+HAVING|\s+LIMIT|;|$)", sql, re.IGNORECASE)
+    if not gby_match:
+        return result_df  # no group by, nothing to verify
+
+    actual_group_cols = {c.strip().lower() for c in gby_match.group(1).split(",")}
+
+    # Check if all resolved group-by concepts used the right column
+    q_lower = question.lower()
+    mismatch = False
+
+    for concept, correct_col in resolved.items():
+        # Only check grouping concepts
+        if concept not in ("doctor", "department", "patient", "insurance",
+                           "admission_type", "city", "diagnosis"):
+            continue
+
+        # Is this concept triggered as a grouping in the question?
+        grouping_triggers = CONCEPT_MAP[concept]["question_triggers"]
+        triggered = any(t in q_lower for t in grouping_triggers)
+        if not triggered:
+            continue
+
+        if correct_col.lower() not in actual_group_cols:
+            mismatch = True
+            break
+
+    if not mismatch:
+        return result_df  # all good
+
+    # Build a corrected SQL directly
+    # Find the revenue/metric column if present
+    revenue_col = resolved.get("revenue")
+    group_col   = None
+
+    for concept in ("doctor", "department", "patient", "insurance", "city", "diagnosis"):
+        if concept in resolved and any(
+            t in q_lower for t in CONCEPT_MAP[concept]["question_triggers"]
+        ):
+            group_col = resolved[concept]
+            break
+
+    if not group_col:
+        return result_df  # can't determine group col
+
+    if revenue_col:
+        corrected_sql = (
+            f"SELECT {group_col}, SUM({revenue_col}) AS total_revenue "
+            f"FROM {table} "
+            f"WHERE {group_col} IS NOT NULL "
+            f"GROUP BY {group_col} "
+            f"ORDER BY total_revenue DESC;"
+        )
+    else:
+        corrected_sql = (
+            f"SELECT {group_col}, COUNT(*) AS count "
+            f"FROM {table} "
+            f"WHERE {group_col} IS NOT NULL "
+            f"GROUP BY {group_col} "
+            f"ORDER BY count DESC;"
+        )
+
+    try:
+        return con.execute(corrected_sql).fetchdf()
+    except Exception:
+        return result_df  # fallback to original result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# AUTO-RETRY EXECUTION
+# ════════════════════════════════════════════════════════════════════════════
+
+class _QueryFailed(Exception):
+    """Internal exception — never surfaced to the user."""
+    pass
+
+
+def execute_with_retry(sql: str, columns: list, date_cols: list, table: str) -> pd.DataFrame:
+    try:
+        return con.execute(sql).fetchdf()
+    except Exception as first_err:
+        # Log internally (server console only — user never sees this)
+        print(f"[SQL attempt 1 failed] {first_err}\nSQL: {sql}")
+
+        fix_prompt = f"""This DuckDB SQL query failed:
+
+Error: {first_err}
+
+SQL:
+{sql}
+
+Table: {table}
+Columns: {columns}
+Date columns (already DATE type — never cast them): {date_cols}
+
+Return ONLY the corrected SQL. No markdown, no explanation."""
+
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": fix_prompt}],
+                max_tokens=400,
+            )
+            fixed_raw = (resp.choices[0].message.content or "").strip()
+            fixed_sql = extract_sql(fixed_raw)
+            fixed_sql = sanitize_sql(fixed_sql, date_cols)
+            fixed_sql = fix_hallucinated_columns(fixed_sql, columns)
+            return con.execute(fixed_sql).fetchdf()
+        except Exception as retry_err:
+            print(f"[SQL attempt 2 failed] {retry_err}")
+            raise _QueryFailed("both attempts failed")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INDIAN MONEY FORMATTER
+# ════════════════════════════════════════════════════════════════════════════
+
+_MONEY_KW = {"revenue","amount","payment","paid","fee","charge","cost","price",
+             "billing","bill","income","salary","wage","balance","due",
+             "receipt","collection","earning","inr","billed","collected"}
+_COUNT_KW = {"count","num","number","qty","quantity","surgeries","surgery",
+             "patients","visits","admissions","cases","procedures","records"}
+
+
+def _is_money_col(name: str) -> bool:
+    low = name.lower()
+    if any(k in low for k in _COUNT_KW):
+        return False
+    return any(k in low for k in _MONEY_KW)
+
+
+def _fmt_indian(v) -> str:
+    try:
+        n = float(v)
+    except (ValueError, TypeError):
+        return str(v)
+    neg = n < 0
+    a   = abs(n)
+    pre = "-" if neg else ""
+    if a >= 1_00_00_000:   return f"{pre}₹{a/1_00_00_000:.2f} crore"
+    if a >= 1_00_000:      return f"{pre}₹{a/1_00_000:.2f} lakh"
+    if a >= 1_000:         return f"{pre}₹{a:,.0f}"
+    return f"{pre}₹{int(a) if a == int(a) else round(a, 2)}"
+
+
+def _clean_val(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def format_result_data(rows: list) -> list:
+    out = []
+    for row in rows:
+        new = {}
+        for k, v in row.items():
+            if _is_money_col(k) and v is not None:
+                try:
+                    f = float(v)
+                    new[k] = v if (f == int(f) and f < 10_000) else _fmt_indian(v)
+                except (ValueError, TypeError):
+                    new[k] = v
+            else:
+                new[k] = v
+        out.append(new)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ANSWER BUILDER
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_answer(question: str, result_data: list) -> str:
+    if not result_data:
+        return "No results found for that query."
+
+    result_text = "\n".join(
+        ", ".join(f"{k}: {v}" for k, v in row.items())
+        for row in result_data
+    )
+
+    prompt = f"""You are a helpful healthcare data assistant.
+
+User asked: "{question}"
+
+Query result:
+{result_text}
+
+Instructions:
+- Write a clean, natural, concise answer in plain English.
+- Do NOT mention SQL, tables, rows, or records.
+- Do NOT use markdown or bullet points.
+- For lists, write as a natural numbered list or a sentence.
+- For a single value, state it directly.
+- Keep it short and direct.
+- Numeric values are already formatted (e.g. "₹2.14 crore"). Use them as-is.
+- The column names in the result ARE the actual data dimension (e.g. if result has "ConsultantName" column, refer to it as "doctor")."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        if resp.choices and resp.choices[0].message.content.strip():
+            return resp.choices[0].message.content.strip()
+    except Exception:
+        pass
+
+    return result_text
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SQL PROMPT BUILDER  (now includes semantic column directives)
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_sql_prompt(
+    question: str,
+    table: str,
+    columns: list,
+    date_cols: list,
+    sample_rows: list,
+    numeric_stats: dict,
+    column_directive: str,   # ← injected from resolve_concept_columns()
+) -> str:
+    date_hint = ""
+    if date_cols:
+        date_hint = (
+            f"\nDate columns (stored as DATE — compare using ISO 'YYYY-MM-DD'): {date_cols}\n"
+            "NEVER use CAST(), STRPTIME(), or TO_DATE() on these — they are already dates.\n"
+        )
+
+    sample_hint = ""
+    if sample_rows:
+        lines = ["  " + " | ".join(f"{k}: {v}" for k, v in row.items()) for row in sample_rows]
+        sample_hint = "\nSample rows (use EXACT column names):\n" + "\n".join(lines) + "\n"
+
+    stats_hint = ""
+    if numeric_stats:
+        lines = [f"  {c}: sum={s['sum']}, min={s['min']}, max={s['max']}" for c, s in numeric_stats.items()]
+        stats_hint = "\nNumeric column stats:\n" + "\n".join(lines) + "\n"
+
+    directive_block = f"\n{column_directive}\n" if column_directive else ""
+
+    return f"""You are a DuckDB SQL expert. Generate ONLY a valid DuckDB SELECT statement.
+
+Table: {table}
+All columns: {columns}
+{date_hint}{sample_hint}{stats_hint}{directive_block}
+GENERAL RULES:
+1. Return ONLY a single SELECT statement ending with semicolon — no explanation, no markdown.
+2. Use ONLY exact column names from the "All columns" list above.
+3. For text filters use ILIKE: WHERE col ILIKE 'value'
+4. ALWAYS write WHERE col IS NOT NULL explicitly for any text column used in GROUP BY.
+5. Date filters must use ISO format: WHERE date_col = '2024-01-15'
+6. NEVER use CAST/STRPTIME/TO_DATE on date columns.
+7. If user says "how many", use COUNT(*). If user says "revenue/amount/total", use SUM().
+
+EXAMPLE — "doctor wise revenue" (assuming doctor col = ConsultantName, revenue col = Total_Amount):
+SELECT ConsultantName, SUM(Total_Amount) AS total_revenue
+FROM {table}
+WHERE ConsultantName IS NOT NULL
+GROUP BY ConsultantName
+ORDER BY total_revenue DESC;
+
+EXAMPLE — "department wise admissions":
+SELECT Department, COUNT(*) AS admissions
+FROM {table}
+WHERE Department IS NOT NULL
+GROUP BY Department
+ORDER BY admissions DESC;
+
+Question: {question}
+SQL:"""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def root():
+    return {"message": "Healthcare Analytics API running 🚀"}
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    contents = await file.read()
+
+    if file.filename.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(contents))
+    else:
+        df = pd.read_excel(io.BytesIO(contents))
+
+    df = clean_columns(df)
+    df, date_cols = normalize_date_columns(df)
+
+    file_id = f"file_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    table   = f"data_{file_id}"
+    con.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM df")
+
+    sample_rows = df.head(3).fillna("").astype(str).to_dict(orient="records")
+
+    numeric_stats: dict = {}
+    for col in df.select_dtypes(include=["number"]).columns:
+        try:
+            s  = _clean_val(float(df[col].sum()))
+            mn = _clean_val(float(df[col].min()))
+            mx = _clean_val(float(df[col].max()))
+            if s is not None:
+                numeric_stats[col] = {"sum": round(s, 2), "min": round(mn, 2), "max": round(mx, 2)}
+        except Exception:
+            pass
+
+    datasets[file_id] = {
+        "table":         table,
+        "columns":       list(df.columns),
+        "date_cols":     date_cols,
+        "sample_rows":   sample_rows,
+        "numeric_stats": numeric_stats,
+    }
+
+    return {
+        "file_id":         file_id,
+        "filename":        file.filename,
+        "rows":            len(df),
+        "columns":         list(df.columns),
+        "preview":         df.head(5).fillna("").to_dict(orient="records"),
+        "numeric_columns": list(df.select_dtypes(include=["number"]).columns),
+        "date_columns":    date_cols,
+    }
+
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    # ── Friendly fallback messages — user never sees raw errors ──────────────
+    FRIENDLY_FALLBACKS = [
+        "I wasn't able to find an answer to that. Could you try rephrasing your question?",
+        "I couldn't process that question right now. Try asking it differently — for example, 'doctor wise revenue' or 'total admissions in March'.",
+        "Something went wrong while looking that up. Please try again with a slightly different question.",
+    ]
+
+    def friendly_error(msg: str = FRIENDLY_FALLBACKS[0]) -> dict:
+        return {"question": request.question, "answer": msg}
+
+    # ── Dataset lookup ────────────────────────────────────────────────────────
+    if request.file_id not in datasets:
+        return friendly_error("Your session has expired. Please re-upload your file and try again.")
+
+    ds            = datasets[request.file_id]
+    table         = ds["table"]
+    columns       = ds["columns"]
+    date_cols     = ds["date_cols"]
+    sample_rows   = ds["sample_rows"]
+    numeric_stats = ds["numeric_stats"]
+
+    try:
+        # ── STEP 1: Resolve semantic concepts → actual columns ────────────────
+        resolved         = resolve_concept_columns(request.question, columns)
+        column_directive = build_column_directive(resolved)
+
+        # ── STEP 2: Build prompt ──────────────────────────────────────────────
+        prompt = build_sql_prompt(
+            request.question, table, columns, date_cols,
+            sample_rows, numeric_stats, column_directive
+        )
+
+        # ── STEP 3: Call LLM ──────────────────────────────────────────────────
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+            )
+            raw_sql = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        except Exception as e:
+            print(f"[LLM error] {e}")
+            return friendly_error("I'm having trouble connecting to the AI service. Please try again in a moment.")
+
+        if not raw_sql:
+            print("[LLM error] blank response")
+            return friendly_error(FRIENDLY_FALLBACKS[1])
+
+        # ── STEP 4: Extract → sanitize → fix columns ──────────────────────────
+        try:
+            sql = extract_sql(raw_sql)
+        except ValueError as e:
+            print(f"[SQL extraction failed] {e}")
+            return friendly_error(FRIENDLY_FALLBACKS[1])
+
+        sql = sanitize_sql(sql, date_cols)
+        sql = fix_hallucinated_columns(sql, columns)
+
+        # ── STEP 5: Execute with auto-retry ───────────────────────────────────
+        try:
+            result_df = execute_with_retry(sql, columns, date_cols, table)
+        except _QueryFailed:
+            return friendly_error(FRIENDLY_FALLBACKS[1])
+
+        # ── STEP 6: Column guard — verify right column was used ───────────────
+        result_df = _verify_and_rerun(
+            sql, result_df, resolved, request.question, table, columns, date_cols
+        )
+
+        result_df   = result_df.where(result_df.notna(), other=None)
+        result_data = [{k: _clean_val(v) for k, v in row.items()} for row in result_df.to_dict(orient="records")]
+        formatted   = format_result_data(result_data)
+        answer      = build_answer(request.question, formatted)
+
+        return {"question": request.question, "answer": answer}
+
+    except Exception as e:
+        # Catch-all safety net — log on server, show nothing technical to user
+        print(f"[Unhandled /ask error] {e}")
+        return friendly_error(FRIENDLY_FALLBACKS[2])
+
+
+@app.post("/forecast")
+async def forecast(request: ForecastRequest):
+    try:
+        from prophet import Prophet
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Prophet not installed. Run: pip install prophet")
+
+    if request.file_id not in datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    ds    = datasets[request.file_id]
+    table = ds["table"]
+
+    try:
+        df = con.execute(f"SELECT * FROM {table}").fetchdf()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read table: {e}")
+
+    date_col  = request.resolved_date_col() or (ds.get("date_cols") or [None])[0]
+    value_col = request.resolved_value_col()
+    periods   = request.resolved_periods()
+    freq      = request.resolved_freq()
+
+    if not date_col:
+        raise HTTPException(status_code=400, detail=f"No date column. Available: {list(df.columns)}")
+    if not value_col:
+        numeric_cols = list(ds.get("numeric_stats", {}).keys())
+        value_col = numeric_cols[0] if numeric_cols else None
+    if not value_col:
+        raise HTTPException(status_code=400, detail="No numeric column found.")
+    if date_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Date column '{date_col}' not in dataset.")
+    if value_col not in ("__count__",) and value_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Value column '{value_col}' not in dataset.")
+
+    if value_col == "__count__":
+        pdf = df[[date_col]].copy()
+        pdf.columns = ["ds"]
+        pdf["ds"] = pd.to_datetime(pdf["ds"], errors="coerce")
+        pdf = pdf.dropna()
+        pdf = pdf.groupby("ds").size().reset_index(name="y")
+    else:
+        pdf = df[[date_col, value_col]].copy()
+        pdf.columns = ["ds", "y"]
+        pdf["ds"] = pd.to_datetime(pdf["ds"], errors="coerce")
+        pdf["y"]  = pd.to_numeric(pdf["y"], errors="coerce")
+        pdf = pdf.dropna()
+        pdf = pdf.groupby("ds", as_index=False)["y"].sum()
+
+    pdf = pdf.sort_values("ds")
+    if len(pdf) < 2:
+        raise HTTPException(status_code=400, detail="Not enough rows to forecast (need >= 2).")
+
+    try:
+        model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+        model.fit(pdf)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prophet fitting failed: {e}")
+
+    future      = model.make_future_dataframe(periods=periods, freq=freq)
+    forecast_df = model.predict(future)
+
+    def cv(v):
+        if v is None: return None
+        try:
+            f = float(v)
+            return None if (math.isnan(f) or math.isinf(f)) else round(f, 2)
+        except Exception: return None
+
+    historical    = [{"date": str(r["ds"])[:10], "value": cv(r["y"])} for _, r in pdf.iterrows()]
+    forecast_rows = [
+        {"date": str(r["ds"])[:10], "predicted": cv(r["yhat"]),
+         "lower": cv(r["yhat_lower"]), "upper": cv(r["yhat_upper"])}
+        for _, r in forecast_df.iterrows()
+    ]
+
+    last_hist   = pdf["ds"].max()
+    future_only = forecast_df[forecast_df["ds"] > last_hist]
+    total_f     = cv(future_only["yhat"].sum())  if not future_only.empty else None
+    avg_f       = cv(future_only["yhat"].mean()) if not future_only.empty else None
+
+    ai_explanation = ""
+    try:
+        trend   = "upward" if not future_only.empty and future_only["yhat"].iloc[-1] > future_only["yhat"].iloc[0] else "downward"
+        label   = "Count of Records" if value_col == "__count__" else value_col
+        ai_resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": (
+                f'Healthcare analyst. Metric: "{label}" | Forecast: {periods} days | '
+                f"Points: {len(pdf)} | Total: {total_f} | Avg: {avg_f} | Trend: {trend}\n"
+                "Write 3-4 sentence analysis + 2 actionable recommendations. "
+                "Indian healthcare context. Plain paragraphs, no bullets."
+            )}],
+            max_tokens=300,
+        )
+        if ai_resp.choices:
+            ai_explanation = ai_resp.choices[0].message.content.strip()
+    except Exception:
+        ai_explanation = f"Forecast complete for {value_col} over the next {periods} days."
+
+    return {
+        "file_id":        request.file_id,
+        "date_col":       date_col,
+        "value_col":      value_col,
+        "metric":         "Count of Records" if value_col == "__count__" else value_col,
+        "periods":        periods,
+        "historical":     historical,
+        "forecast":       forecast_rows,
+        "ai_explanation": ai_explanation,
+        "summary": {
+            "forecast_total": total_f,
+            "forecast_avg":   avg_f,
+            "forecast_from":  str(last_hist)[:10],
+            "forecast_to":    str(future_only["ds"].max())[:10] if not future_only.empty else None,
+        },
+    }
+
+
+@app.get("/forecast/columns/{file_id}")
+async def forecast_columns(file_id: str):
+    if file_id not in datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    ds = datasets[file_id]
+    return {
+        "file_id":       file_id,
+        "date_columns":  ds.get("date_cols", []),
+        "value_columns": ["__count__"] + list(ds.get("numeric_stats", {}).keys()),
+        "value_labels": {
+            "__count__": "Count of Records (per day)",
+            **{c: c for c in ds.get("numeric_stats", {}).keys()},
+        },
+    }
+
+
+@app.get("/summary/{file_id}")
+async def get_summary(file_id: str):
+    if file_id not in datasets:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    ds            = datasets[file_id]
+    table         = ds["table"]
+    columns       = ds["columns"]
+    numeric_stats = ds["numeric_stats"]
+    date_cols     = ds["date_cols"]
+    sample_rows   = ds["sample_rows"]
+
+    profile = [f"Table has {len(columns)} columns."]
+    for col, s in numeric_stats.items():
+        profile.append(f"  - {col}: total={s['sum']}, min={s['min']}, max={s['max']}")
+    for dc in date_cols:
+        try:
+            row = con.execute(f"SELECT MIN({dc}), MAX({dc}) FROM {table}").fetchone()
+            if row:
+                profile.append(f"  - Date range ({dc}): {row[0]} to {row[1]}")
+        except Exception:
+            pass
+    if sample_rows:
+        profile.append("Sample: " + ", ".join(f"{k}={v}" for k, v in list(sample_rows[0].items())[:6]))
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": (
+                f"Expert healthcare data analyst.\n"
+                f"Dataset columns: {columns}\n" + "\n".join(profile) + "\n\n"
+                "Generate 5-6 numbered, specific, actionable insights for hospital management.\n"
+                "Focus on revenue, patient volume, efficiency, anomalies. Indian healthcare context.\n"
+                "Plain numbered list, no markdown, 1-2 sentences each."
+            )}],
+            max_tokens=600,
+        )
+        ai_insights = resp.choices[0].message.content.strip() if resp.choices else "Could not generate insights."
+    except Exception as e:
+        ai_insights = f"Could not generate insights: {e}"
+
+    safe_stats = {
+        col: {k: (_clean_val(v) if isinstance(v, float) else v) for k, v in vals.items()}
+        for col, vals in numeric_stats.items()
+    }
+
+    return {
+        "file_id":       file_id,
+        "columns":       columns,
+        "date_cols":     date_cols,
+        "numeric_stats": safe_stats,
+        "ai_insights":   ai_insights,
+    }
