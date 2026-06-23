@@ -5,9 +5,15 @@ import tempfile
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Load local embedding model (downloads automatically if not present, then cached)
-# all-MiniLM-L6-v2 is extremely fast and high quality for general/medical English.
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# Load local embedding model lazily to save RAM on startup
+embedder = None
+
+def get_embedder():
+    global embedder
+    if embedder is None:
+        from sentence_transformers import SentenceTransformer
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return embedder
 
 # We will store indices in memory for the active session, 
 # keyed by file_id.
@@ -33,7 +39,8 @@ def build_faiss_index(file_id: str, text: str):
         return
         
     # 2. Embedding
-    embeddings = embedder.encode(chunks, show_progress_bar=False)
+    model = get_embedder()
+    embeddings = model.encode(chunks, show_progress_bar=False)
     
     # 3. FAISS Index
     dimension = embeddings.shape[1]
@@ -58,7 +65,8 @@ def search_faiss_index(file_id: str, query: str, top_k: int = 5) -> str:
     index = store["index"]
     chunks = store["chunks"]
     
-    query_emb = embedder.encode([query])
+    model = get_embedder()
+    query_emb = model.encode([query])
     D, I = index.search(np.array(query_emb).astype("float32"), top_k)
     
     results = []
