@@ -936,7 +936,7 @@ async def build_custom_chart(req: BuildChartRequest, user=Depends(require_user))
                 if not fv:
                     filter_sql += f" AND FALSE "
                 else:
-                    vals_joined = ", ".join(f"'{str(x).replace('\'', '\'\'')}'" for x in fv)
+                    vals_joined = ", ".join("'" + str(x).replace("'", "''") + "'" for x in fv)
                     filter_sql += f" AND {fc_sql} IN ({vals_joined}) "
             else:
                 fv_esc = str(fv).replace("'", "''")
@@ -1164,7 +1164,7 @@ async def _build_custom_kpi(req: BuildKpiRequest):
                 if not fv:
                     filter_sql += f" AND FALSE "
                 else:
-                    vals_joined = ", ".join(f"'{str(x).replace('\'', '\'\'')}'" for x in fv)
+                    vals_joined = ", ".join("'" + str(x).replace("'", "''") + "'" for x in fv)
                     filter_sql += f" AND {fc_sql} IN ({vals_joined}) "
             else:
                 fv_esc = str(fv).replace("'", "''")
